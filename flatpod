@@ -1,0 +1,629 @@
+#!/usr/bin/env gjs
+
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+const System = imports.system
+const ByteArray = imports.byteArray
+const {GLib, Gio, GObject, Flatpak, OSTree} = imports.gi
+
+
+const VERSION = '0.1'
+
+// From OSTree's source
+const FAST_QUERYINFO = [
+  'standard::name',
+  'standard::type',
+  'standard::size',
+  'standard::is-symlink',
+  'standard::symlink-target',
+  'unix::device',
+  'unix::inode',
+  'unix::mode',
+  'unix::uid',
+  'unix::gid',
+  'unix::rdev',
+].join(',')
+
+
+const OCI_ARCH_TO_FLATPAK = {
+  '386': 'i386',
+  amd64: 'x86_64',
+  arm: 'arm',
+  arm64: 'aarch64',
+  mips: 'mips',
+  mipsle: 'mipsel',
+  mips64: 'mips64',
+  mips64le: 'mips64el',
+}
+
+
+const FLATPOD_REMOTE = 'flatpod-origin'
+
+
+let ProgressKind = {
+  Percent: Symbol('Percent'),
+  Slash: Symbol('Slash'),
+}
+
+
+class Progress {
+  constructor(message, total, kind) {
+    this._message = message
+    this._total = total
+    this._stdout = Gio.UnixOutputStream.new(1, false)
+    this._kind = kind || ProgressKind.Percent
+    this._lastValue = null
+
+    if (this._total) {
+      this.update(0)
+    } else {
+      this.done()
+    }
+  }
+
+  _printBracketed(what) {
+    this._stdout.write(`\r[\u001b[36m${what}\u001b[0m] `, null)
+  }
+
+  setMessage(message) {
+    this._message = message
+  }
+
+  update(value) {
+    if (this._total) {
+      switch (this._kind) {
+      case ProgressKind.Percent:
+        let currentPercent = (value / this._total) * 100
+        let formattedPercent = currentPercent.toFixed(0).toString().padStart(3, ' ')
+
+        this._printBracketed(`${formattedPercent}%`)
+        break;
+      case ProgressKind.Slash:
+        let totalLength = this._total.toString().length
+        let formattedValue = value.toString().padStart(totalLength, ' ')
+
+        this._printBracketed(`${formattedValue}/${this._total}`)
+        break;
+      }
+    } else {
+      this._printBracketed('###')
+    }
+
+    this._stdout.write(this._message, null)
+    this._stdout.flush(null)
+
+    this._lastValue = value
+  }
+
+  next(increment = 1) {
+    this.update(this._lastValue + increment)
+  }
+
+  done() {
+    this.update(this._total)
+    this._stdout.write('\n', null)
+    this._stdout.flush(null)
+  }
+}
+
+
+var Flatpod = GObject.registerClass({
+}, class Flatpod extends Gio.Application {
+  _init() {
+    super._init({})
+
+    this.set_option_context_summary('Convert a container image into a Flatpak runtime.')
+
+    this.add_main_option('version', 0, 0, GLib.OptionArg.NONE, 'Show the version', null)
+    this.add_main_option('verbose', 'v'.charCodeAt(0), 0, GLib.OptionArg.NONE, 'Be verbose', null)
+    this.add_main_option('runtime-id', 'i'.charCodeAt(0), 0, GLib.OptionArg.STRING,
+                         'The target runtime ID', 'ID')
+    this.add_main_option('runtime-branch', 'b'.charCodeAt(0), 0, GLib.OptionArg.STRING,
+                         'The target runtime branch', 'BRANCH')
+    this.add_main_option(GLib.OPTION_REMAINING, 0, 0, GLib.OptionArg.STRING_ARRAY, '', null)
+  }
+
+  log(level, message) {
+    let key = GLib.Variant.new_string('MESSAGE')
+    let value = GLib.Variant.new_variant(GLib.Variant.new_string(message))
+    let dict = GLib.Variant.new_array(new GLib.VariantType('{sv}'),
+                                      [GLib.Variant.new_dict_entry(key, value)])
+    GLib.log_variant(null, level, dict)
+  }
+
+  info(message) {
+    this.log(GLib.LogLevelFlags.LEVEL_INFO, message)
+  }
+
+  assert(cond, message) {
+    if (!cond) {
+      throw new Error(`assertion failed: ${message}`)
+    }
+  }
+
+  getArgs(cmdline) {
+    if (cmdline[''] == undefined) {
+      return []
+    }
+
+    return cmdline[''].get_variant().deep_unpack()
+  }
+
+  getDefaultRuntimeInfo(image) {
+    // This monster regex just does a smart splitting of the image name
+    let [server, name, tag] = image.match(/^(?:([^\/.]+\.[^\/]+)\/)?([^:]+)(?::(.+))?$/).slice(1)
+    server = server || 'docker.io'
+    tag = tag || 'latest'
+
+    let serverParts = server.split('.')
+    serverParts.reverse()
+    let id = [...serverParts, name].join('.')
+
+    let branch = tag == 'latest' ? 'master' : tag
+    return {id, branch}
+  }
+
+  parseJson(file) {
+    let [success, bytes, etag] = file.load_contents(null)
+    this.assert(success, `failed to read ${file.peek_path()}`)
+    return JSON.parse(ByteArray.toString(bytes))
+  }
+
+  escapeString(string) {
+    return GLib.uri_escape_string(string, null, true).replace(/%/g, '_')
+  }
+
+  getOciRef(suffix) {
+    return `ociimage/${suffix}`
+  }
+
+  getImageRef(image) {
+    return this.getOciRef(this.escapeString(image))
+  }
+
+  spawn(command, flags) {
+    this.info(`spawn: ${command.map((c) => GLib.shell_quote(c)).join(' ')}`)
+
+    let subprocess = Gio.Subprocess.new(command, flags || Gio.SubprocessFlags.NONE)
+    subprocess.wait(null)
+    if (!subprocess.get_successful()) {
+      System.exit(subprocess.get_exit_status())
+    }
+  }
+
+  podmanPushToRepo(image, repo) {
+    let progress = new Progress('Pushing image to Flatpak repo via podman...')
+
+    let path = repo.get_path().get_path()
+    this.spawn(['podman', 'push', image, `ostree:${image}@${path}`])
+  }
+
+  checkoutRootCommit(targetRepo, imageRef, buildDir) {
+    let progress = new Progress('Checking out root commit...')
+
+    let rootCommit = this.checkoutRef(targetRepo, imageRef, buildDir)
+  }
+
+  * walkDirectory(file) {
+    let enumerator = file.enumerate_children('standard::name,standard::type',
+                                             Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, null)
+
+    let fileInfo
+    while ((fileInfo = enumerator.next_file(null))) {
+      let child = file.get_child(fileInfo.get_name())
+      yield [child, fileInfo]
+    }
+
+    enumerator.close(null)
+  }
+
+  recursiveDelete(file, progress) {
+    for (let [child, fileInfo] of this.walkDirectory(file)) {
+      if (fileInfo.get_file_type() == Gio.FileType.DIRECTORY) {
+        this.recursiveDelete(child, progress)
+      } else {
+        child.delete(null)
+      }
+
+      if (progress) {
+        progress.next()
+      }
+    }
+
+    file.delete(null)
+  }
+
+  removeBuildDir(buildDir) {
+    let buildDirSize = this.getDirectoryItemCount(buildDir)
+    let progress = new Progress('Removing build directory...', buildDirSize)
+    this.recursiveDelete(buildDir, progress)
+    progress.done()
+  }
+
+  checkoutRef(repo, ref, target) {
+    let [commitFound, commit] = repo.resolve_rev(ref, false)
+    this.assert(commitFound, `failed to find revision ${ref}`)
+
+    let [success, root] = repo.read_commit(commit, null)
+    this.assert(success, `failed to read ${commit} for checkout`)
+
+    let fileInfo = root.query_info(FAST_QUERYINFO, Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, null)
+
+    repo.checkout_tree(OSTree.RepoCheckoutMode.USER,
+                       OSTree.RepoCheckoutOverwriteMode.UNION_FILES, target, root, fileInfo, null)
+
+    return commit
+  }
+
+  checkoutOciDigest(repo, digest, target) {
+    this.assert(digest.startsWith('sha256:'), `invalid digest: ${digest}`)
+    let ref = this.getOciRef(digest.split(':')[1])
+    this.checkoutRef(repo, ref, target)
+  }
+
+  checkoutLayers(repo, target) {
+    let manifestFile = target.get_child('manifest.json')
+    let manifest = this.parseJson(manifestFile)
+
+    let progress = new Progress('Checking out layers...', manifest.layers.length,
+                                ProgressKind.Slash)
+
+    for (let layer of manifest.layers) {
+      let digest = layer.digest
+      this.checkoutOciDigest(repo, digest, target)
+
+      progress.next()
+    }
+
+    this.checkoutOciDigest(repo, manifest.config.digest, target)
+    progress.done()
+  }
+
+  fixPermissions(directory) {
+    let progress = new Progress('Fixing filesystem permissions...')
+    // XXX: Gjs has no chmod, and this is probably far faster anyway
+    this.spawn(['chmod', '-R', 'u+rw', directory.get_path()])
+  }
+
+  cleanupTree(directory) {
+    const TO_REMOVE = [
+      // Directories
+      'dev', 'home', 'media', 'mnt', 'proc', 'root', 'run', 'sys', 'tmp', 'var/cache', 'var/mail',
+      'var/tmp', 'var/run',
+      // Files
+      'content', 'manifest.json',
+    ]
+
+    let progress = new Progress('Cleaning up filesystem tree...', TO_REMOVE.length)
+
+    for (let childName of TO_REMOVE) {
+      let child = directory.get_child(childName)
+      if (child.query_exists(null)) {
+        try {
+          child.delete(null)
+        } catch (e) {
+          if (e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_EMPTY)) {
+            this.recursiveDelete(child)
+          } else {
+            throw e
+          }
+        }
+      }
+
+      progress.next()
+    }
+
+    progress.done()
+  }
+
+  getUniqueFileId(file) {
+    let info = file.query_info('id::file', 0, null)
+    return info.get_attribute_string('id::file')
+  }
+
+  getDirectoryItemCount(directory) {
+    let result = 0
+
+    for (let [child, fileInfo] of this.walkDirectory(directory)) {
+      result++
+
+      if (fileInfo.get_file_type() == Gio.FileType.DIRECTORY) {
+        result += this.getDirectoryItemCount(child)
+      }
+    }
+
+    return result
+  }
+
+  mergeTo(source, target, progress, options = {}) {
+    let targetDirectoryCreated = false
+
+    let keepRoot = options.keepRoot || false
+
+    let childOptions = Object.assign({}, options)
+    delete childOptions.keepRoot
+
+    for (let [child, fileInfo] of this.walkDirectory(source)) {
+      progress.next()
+
+      // Support merging a directory into a child of itself
+      if (child.equal(target)) {
+        continue
+      }
+
+      let targetChild = target.get_child(fileInfo.get_name())
+
+
+      if (targetChild.query_exists(null) &&
+          targetChild.query_info('standard::type', Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, null)
+                     .get_file_type() == Gio.FileType.SYMBOLIC_LINK &&
+          this.getUniqueFileId(child) == this.getUniqueFileId(targetChild)) {
+        // If the target is a symlink pointing to this, delete it to avoid overwriting.
+        targetChild.delete(null)
+      }
+
+      if (fileInfo.get_file_type() == Gio.FileType.DIRECTORY) {
+        this.mergeTo(child, targetChild, progress, childOptions)
+      } else {
+        if (targetChild.query_exists(null) &&
+            this.getUniqueFileId(child) == this.getUniqueFileId(targetChild)) {
+          child.delete(null)
+          continue
+        }
+
+        if (!targetDirectoryCreated) {
+          if (!target.query_exists(null)) {
+            target.make_directory_with_parents(null)
+          }
+
+          targetDirectoryCreated = true
+        }
+
+        child.move(targetChild,
+                   Gio.FileCopyFlags.NOFOLLOW_SYMLINKS | Gio.FileCopyFlags.NO_FALLBACK_FOR_MOVE,
+                   null, null)
+      }
+    }
+
+    if (!keepRoot) {
+      source.delete(null)
+    }
+  }
+
+  mergeUsr(directory) {
+    let usr = directory.get_child('usr')
+    this.assert(usr.query_exists(null), 'no /usr to merge')
+
+    let total = this.getDirectoryItemCount(usr)
+    let progress = new Progress('Merging /usr of tree...', total)
+
+    this.mergeTo(usr.get_child('local'), directory, progress)
+    this.mergeTo(usr, directory, progress)
+
+    progress.done()
+  }
+
+  setupFlatpakTree(buildDir) {
+    let total = this.getDirectoryItemCount(buildDir)
+    let progress = new Progress('Setting up Flatpak build tree...', total)
+
+    let buildFiles = buildDir.get_child('files')
+    buildFiles.make_directory_with_parents(null)
+
+    this.mergeTo(buildDir, buildFiles, progress, { keepRoot: true })
+
+    progress.done()
+  }
+
+  writeFlatpakMetadata(buildDir, imageConfig, runtimeInfo) {
+    let kf = new GLib.KeyFile()
+
+    kf.set_string('Runtime', 'name', runtimeInfo.id)
+    kf.set_string('Runtime', 'runtime', runtimeInfo.fullName)
+    kf.set_string('Runtime', 'sdk', runtimeInfo.fullName)
+
+    for (var env of imageConfig.config.Env) {
+      let [name, value] = env.split(/=(.+)/)
+      kf.set_string('Environment', name, value)
+    }
+
+    kf.save_to_file(buildDir.get_child('metadata').get_path())
+  }
+
+  writeFlatpakAppdata(buildDir, runtimeInfo) {
+    let xml = `<?xml version="1.0" encoding="UTF-8"?>
+<component type="runtime">
+  <id>${runtimeInfo.id}</id>
+  <metadata_license>CC0</metadata_license>
+  <name>${runtimeInfo.fullName}</name>
+  <summary>Flatpod-generated runtime</summary>
+</component>`
+
+    let appdata = buildDir.get_child('files').get_child('share').get_child('appdata')
+                          .get_child(`${runtimeInfo.id}.appdata.xml`)
+    appdata.get_parent().make_directory_with_parents(null)
+    appdata.replace_contents(xml, null, false, 0, null)
+
+    this.spawn(['appstream-compose', `--prefix=${buildDir.get_child('files').get_path()}`,
+                `--basename=${runtimeInfo.id}`, '--origin=flatpak', runtimeInfo.id],
+               Gio.SubprocessFlags.STDOUT_SILENCE)
+  }
+
+  writeOciRun(buildDir, imageConfig) {
+    if (!imageConfig.config.Cmd) {
+      return
+    }
+
+    let command = imageConfig.config.Cmd.map((p) => GLib.shell_quote(p))
+    command.push('"$@"')
+
+    let ociRun = buildDir.get_child('files').get_child('bin').get_child('oci-run')
+    ociRun.replace_contents(`#!/bin/sh\nexec ${command.join(' ')}`, null, false, 0, null)
+  }
+
+  writeFlatpakFiles(buildDir, imageConfig, runtimeInfo) {
+    let progress = new Progress('Writing Flatpak files...')
+
+    this.writeFlatpakMetadata(buildDir, imageConfig, runtimeInfo)
+    this.writeFlatpakAppdata(buildDir, runtimeInfo)
+    this.writeOciRun(buildDir, imageConfig)
+  }
+
+  commitBuildTree(repo, buildDir, runtimeInfo) {
+    let progress = new Progress('Writing OSTree commit...')
+
+    let ref = `runtime/${runtimeInfo.fullName}`
+    let [parentRefFound, parentRef] = repo.resolve_rev(ref, true)
+
+    let subject = `flatpod update on ${new Date().toISOString()}`
+
+    repo.prepare_transaction(null)
+    repo.scan_hardlinks(null)
+
+    let flags = OSTree.RepoCommitModifierFlags.CANONICAL_PERMISSIONS
+    let modifier = new OSTree.RepoCommitModifier(flags, null)
+
+    let mtree = new OSTree.MutableTree()
+    repo.write_directory_to_mtree(buildDir, mtree, modifier, null)
+    let [writeSuccess, root] = repo.write_mtree(mtree, null)
+    let [commitSuccess, commit] = repo.write_commit(parentRef, subject, null, null, root, null)
+
+    repo.transaction_set_ref(null, ref, commit)
+
+    repo.commit_transaction(null)
+    repo.regenerate_summary(null, null)
+  }
+
+  installFlatpak(sourceRepo, runtimeInfo) {
+    let progress = new Progress('Installing resulting Flatpak...', 100)
+
+    let flatpakUserInstall = Flatpak.Installation.new_user(null)
+
+    let newRemote = Flatpak.Remote.new(FLATPOD_REMOTE)
+    newRemote.set_gpg_verify(false)
+    newRemote.set_url(sourceRepo.get_path().get_uri())
+
+    flatpakUserInstall.modify_remote(newRemote, null)
+
+    let progressCallback = (status, percent, estimating) => {
+      progress.setMessage(`Installing resulting Flatpak: ${status}...`)
+      progress.update(percent)
+    }
+
+    try {
+      flatpakUserInstall.install(FLATPOD_REMOTE, Flatpak.RefKind.RUNTIME, runtimeInfo.id,
+                                 runtimeInfo.arch, runtimeInfo.branch, progressCallback, null)
+    } catch (e) {
+      if (e.matches(Flatpak.Error, Flatpak.Error.ALREADY_INSTALLED)) {
+        flatpakUserInstall.update(Flatpak.UpdateFlags.NONE, Flatpak.RefKind.RUNTIME,
+                                  runtimeInfo.id, runtimeInfo.arch, runtimeInfo.branch,
+                                  progressCallback, null)
+      } else {
+        throw e
+      }
+    }
+
+    progress.done()
+  }
+
+  convertImage(image, runtimeInfo, dataDir, buildDir) {
+    let targetRepoFile = dataDir.get_child('repo')
+
+    let targetRepo = OSTree.Repo.new(targetRepoFile)
+    targetRepo.create(OSTree.RepoMode.ARCHIVE_Z2, null)
+
+    let imageRef = this.getImageRef(image)
+    this.info(`Root image ref: ${imageRef}`)
+
+    this.podmanPushToRepo(image, targetRepo)
+    let rootCommit = this.checkoutRootCommit(targetRepo, imageRef, buildDir)
+
+    this.checkoutLayers(targetRepo, buildDir)
+
+    let imageConfig = this.parseJson(buildDir.get_child('content'))
+    runtimeInfo.arch = OCI_ARCH_TO_FLATPAK[imageConfig.architecture]
+    runtimeInfo.fullName = `${runtimeInfo.id}/${runtimeInfo.arch}/${runtimeInfo.branch}`
+
+    this.info(`runtimeInfo.arch: ${runtimeInfo.arch}`)
+    this.info(`runtimeInfo.fullName: ${runtimeInfo.fullName}`)
+
+    this.fixPermissions(buildDir)
+    this.cleanupTree(buildDir)
+
+    this.mergeUsr(buildDir)
+    this.setupFlatpakTree(buildDir)
+    this.writeFlatpakFiles(buildDir, imageConfig, runtimeInfo)
+
+    this.commitBuildTree(targetRepo, buildDir, runtimeInfo)
+    this.installFlatpak(targetRepo, runtimeInfo)
+  }
+
+  vfunc_handle_local_options(cmdlineDict) {
+    let cmdline = cmdlineDict.end().unpack()
+
+    if (cmdline.version) {
+      print(VERSION)
+      System.exit(0)
+    }
+
+    if (cmdline.verbose) {
+      GLib.setenv('G_MESSAGES_DEBUG', 'all', true)
+    }
+
+    let args = this.getArgs(cmdline)
+    if (args.length != 1) {
+      print('Expected one argument, a container image.')
+      System.exit(1)
+    }
+
+    let image = args[0]
+    if (image.indexOf(':') == -1) {
+      image += ':latest'
+    }
+
+    let dataDir = Gio.File.new_for_path(GLib.get_user_data_dir()).get_child('flatpod')
+    let tmpDir = dataDir.get_child('builds')
+
+    if (!tmpDir.query_exists(null)) {
+      tmpDir.make_directory_with_parents(null)
+    }
+
+    GLib.setenv('TMPDIR', tmpDir.get_path(), true)
+
+    let runtimeInfo = this.getDefaultRuntimeInfo(image)
+
+    if (cmdline['runtime-id']) {
+      runtimeInfo.id = cmdline['runtime-id'].get_variant().unpack()
+    }
+    if (cmdline['runtime-branch']) {
+      runtimeInfo.branch = cmdline['runtime-branch'].get_variant().unpack()
+    }
+
+    this.info(`runtimeInfo.id: ${runtimeInfo.id}`)
+    this.info(`runtimeInfo.branch: ${runtimeInfo.branch}`)
+
+    let buildDirPath = GLib.Dir.make_tmp(`${this.escapeString(image)}.XXXXXX`)
+    let buildDir = Gio.File.new_for_path(buildDirPath)
+
+    try {
+      this.assert(false)
+      this.convertImage(image, runtimeInfo, dataDir, buildDir)
+    } catch (e) {
+      print(`[\u001b[31mERROR\u001b[0m] The build output is located at: ${buildDirPath}`)
+      throw e
+    }
+
+    this.removeBuildDir(buildDir)
+    print(`[\u001b[32mSUCCESS\u001b[0m] You can now run: ${runtimeInfo.fullName}`)
+  }
+})
+
+GLib.set_prgname('flatpod')
+GLib.set_application_name('flatpod')
+
+let app = new Flatpod()
+let invocation = [System.programInvocationName].concat(ARGV)
+
+app.run(invocation)
