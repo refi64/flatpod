@@ -363,11 +363,6 @@ var Flatpod = GObject.registerClass({
     progress.done()
   }
 
-  getUniqueFileId(file) {
-    let info = file.query_info('id::file', 0, null)
-    return info.get_attribute_string('id::file')
-  }
-
   getDirectoryItemCount(directory) {
     let result = 0
 
@@ -380,6 +375,25 @@ var Flatpod = GObject.registerClass({
     }
 
     return result
+  }
+
+  isSymlinkTo(file, linksTo, root) {
+    let info = file.query_info('standard::type,standard::symlink-target',
+                               Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, null)
+    if (info.get_file_type() != Gio.FileType.SYMBOLIC_LINK) {
+      return
+    }
+
+    let target = info.get_symlink_target()
+    let targetFile
+
+    if (root && target.startsWith('/')) {
+      targetFile = root.resolve_relative_path(target.substring(1))
+    } else {
+      targetFile = file.get_parent().resolve_relative_path(target)
+    }
+
+    return targetFile.equal(linksTo)
   }
 
   mergeTo(source, target, progress, options = {}) {
@@ -400,24 +414,20 @@ var Flatpod = GObject.registerClass({
 
       let targetChild = target.get_child(fileInfo.get_name())
 
-
-      if (targetChild.query_exists(null) &&
-          targetChild.query_info('standard::type', Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, null)
-                     .get_file_type() == Gio.FileType.SYMBOLIC_LINK &&
-          this.getUniqueFileId(child) == this.getUniqueFileId(targetChild)) {
-        // If the target is a symlink pointing to this, delete it to avoid overwriting.
-        targetChild.delete(null)
+      if (targetChild.query_exists(null)) {
+        if (this.isSymlinkTo(child, targetChild, options.root)) {
+          // If this is a symlink to the target, just delete this and move on.
+          child.delete(null)
+          continue
+        } else if (this.isSymlinkTo(targetChild, child, options.root)) {
+          // If the target is a symlink to this, just delete the target.
+          targetChild.delete(null)
+        }
       }
 
       if (fileInfo.get_file_type() == Gio.FileType.DIRECTORY) {
         this.mergeTo(child, targetChild, progress, childOptions)
       } else {
-        if (targetChild.query_exists(null) &&
-            this.getUniqueFileId(child) == this.getUniqueFileId(targetChild)) {
-          child.delete(null)
-          continue
-        }
-
         if (!targetDirectoryCreated) {
           if (!target.query_exists(null)) {
             target.make_directory_with_parents(null)
@@ -444,8 +454,8 @@ var Flatpod = GObject.registerClass({
     let total = this.getDirectoryItemCount(usr)
     let progress = new Progress('Merging /usr of tree...', total)
 
-    this.mergeTo(usr.get_child('local'), directory, progress)
-    this.mergeTo(usr, directory, progress)
+    this.mergeTo(usr.get_child('local'), directory, progress, { root: directory })
+    this.mergeTo(usr, directory, progress, { root: directory })
 
     progress.done()
   }
