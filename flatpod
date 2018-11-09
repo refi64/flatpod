@@ -4,6 +4,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+// vim: syntax=javascript
+
 const System = imports.system
 const ByteArray = imports.byteArray
 const {GLib, Gio, GObject, Flatpak, OSTree} = imports.gi
