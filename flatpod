@@ -256,10 +256,18 @@ var Flatpod = GObject.registerClass({
     enumerator.close(null)
   }
 
-  recursiveDelete(file, progress) {
+  recursiveDelete(file, progress, countBytes) {
+    let bytesDeleted = 0
+
     for (let [child, fileInfo] of this.walkDirectory(file)) {
+      if (countBytes) {
+        bytesDeleted += child.query_info('standard::size',
+                                         Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, null)
+                             .get_size()
+      }
+
       if (fileInfo.get_file_type() == Gio.FileType.DIRECTORY) {
-        this.recursiveDelete(child, progress)
+        bytesDeleted += this.recursiveDelete(child, progress, countBytes)
       } else {
         child.delete(null)
       }
@@ -270,6 +278,7 @@ var Flatpod = GObject.registerClass({
     }
 
     file.delete(null)
+    return bytesDeleted
   }
 
   removeBuildDir(buildDir) {
@@ -710,16 +719,27 @@ var Flatpod = GObject.registerClass({
     // XXX: OSTree doesn't seem to expose an API for this
     let cacheDir = repo.get_path().get_child('uncompressed-objects-cache')
     if (!cacheDir.query_exists(null)) {
-      return
+      return 0
     }
 
     let cacheSize = this.getDirectoryItemCount(cacheDir)
     let progress = new Progress('Clearing uncompressed object cache...', cacheSize)
-    this.recursiveDelete(cacheDir, progress)
+    let deleted = this.recursiveDelete(cacheDir, progress, true)
     progress.done()
+
+    return deleted
+  }
+
+  pruneRepo(repo) {
+    let progress = new Progress('Pruning repository...')
+    let [_, objFound, objDeleted, bytesDeleted] = repo.prune(OSTree.RepoPruneFlags.REFS_ONLY, 0,
+                                                             null)
+    return bytesDeleted
   }
 
   cleanupRepo(repo, cleanupType) {
+    let bytesDeleted = 0
+
     repo.open(null)
     repo.prepare_transaction(null)
 
@@ -737,13 +757,12 @@ var Flatpod = GObject.registerClass({
 
     repo.commit_transaction(null)
 
-    this.clearUncompressedObjectCache(repo)
+    bytesDeleted += this.clearUncompressedObjectCache(repo)
+    bytesDeleted += this.pruneRepo(repo)
 
-    let progress = new Progress('Pruning repository...')
+    let megabytesDeletedString = (bytesDeleted / 1024 / 1024).toFixed(2)
 
-    let [_, objFound, objDeleted, bytesDeleted] = repo.prune(OSTree.RepoPruneFlags.REFS_ONLY, 0,
-                                                             null)
-    this.success(`${(bytesDeleted / 1024 / 1024).toFixed(2)}mb deleted`)
+    this.success(`${megabytesDeletedString}mb deleted`)
   }
 
   vfunc_handle_local_options(cmdlineDict) {
