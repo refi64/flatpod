@@ -15,6 +15,12 @@ the runtimes aren't really intended for publishing (you can try if you want thou
 TL;DR: **All these requirements are already satisfied on any system with GNOME and Flatpak**.
 In particular, it runs out-of-the-box without any layered packages on Fedora Silverblue.
 
+## Installation
+
+Just copy `flatpod` to somewhere in your path, or run `./install.sh` to install to
+`/usr/local/bin`. You can change the prefix, too, e.g. `./install.sh /usr` to install to
+`/usr/bin`.
+
 ## Usage
 
 Just run `flatpod container-name`, and the container will autmatically be converted to a Flatpak.
