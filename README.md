@@ -26,3 +26,15 @@ By default, the container name will undergo conversion for the resulting runtime
 
 You can change the Flatpak ID with `flatpod -i my.runtime.id` and the branch via
 `flatpod -b my-branch`.
+
+## Disk space
+
+There are a couple of ways to reclaim disk space used by the Flatpod OSTree repo (stored in
+`$HOME/.local/share/flatpod/repo`):
+
+- To run a basic prune and clear the object cache, run `flatpod --cleanup prune`.
+- To remove any branches related to runtimes that are unused (for instance, if you uninstalled
+  them), run `flatpod --cleanup unused`.
+- To remove all the OCI branches (will not remove the Flatpak runtimes but will require
+  `podman` to re-push everything), run `flatpod --cleanup oci`.
+- To clear all of the above, run `flatpod --cleanup all`.
