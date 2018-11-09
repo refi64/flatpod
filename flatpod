@@ -9,7 +9,7 @@ const ByteArray = imports.byteArray
 const {GLib, Gio, GObject, Flatpak, OSTree} = imports.gi
 
 
-const VERSION = '0.1'
+const VERSION = '1'
 
 // From OSTree's source
 const FAST_QUERYINFO = [
@@ -51,8 +51,8 @@ let CleanupType = {
 
 
 let ProgressKind = {
-  Percent: Symbol('ProgressKind.Percent'),
-  Slash: Symbol('ProgressKind.Slash'),
+  percent: Symbol('ProgressKind.percent'),
+  slash: Symbol('ProgressKind.slash'),
 }
 
 
@@ -61,7 +61,7 @@ class Progress {
     this._message = message
     this._total = total
     this._stdout = Gio.UnixOutputStream.new(1, false)
-    this._kind = kind || ProgressKind.Percent
+    this._kind = kind || ProgressKind.percent
     this._lastValue = null
 
     if (this._total) {
@@ -82,13 +82,13 @@ class Progress {
   update(value) {
     if (this._total) {
       switch (this._kind) {
-      case ProgressKind.Percent:
+      case ProgressKind.percent:
         let currentPercent = (value / this._total) * 100
         let formattedPercent = currentPercent.toFixed(0).toString().padStart(3, ' ')
 
         this._printBracketed(`${formattedPercent}%`)
         break;
-      case ProgressKind.Slash:
+      case ProgressKind.slash:
         let totalLength = this._total.toString().length
         let formattedValue = value.toString().padStart(totalLength, ' ')
 
@@ -288,6 +288,18 @@ var Flatpod = GObject.registerClass({
     progress.done()
   }
 
+  removeAllBuildDirs(tmpDir) {
+    if (!tmpDir.query_exists(null)) {
+      return
+    }
+
+    let tmpDirSize = this.getDirectoryItemCount(tmpDir)
+    let progress = new Progress('Removing old build directories...', tmpDirSize)
+    let bytesDeleted = this.recursiveDelete(tmpDir, progress, true)
+    progress.done()
+    return bytesDeleted
+  }
+
   checkoutRef(repo, ref, target) {
     let [commitFound, commit] = repo.resolve_rev(ref, false)
     this.assert(commitFound, `failed to find revision ${ref}`)
@@ -313,7 +325,7 @@ var Flatpod = GObject.registerClass({
     let manifest = this.parseJsonFile(manifestFile)
 
     let progress = new Progress('Checking out layers...', manifest.layers.length,
-                                ProgressKind.Slash)
+                                ProgressKind.slash)
 
     this.undebug(() => {
       for (let layer of manifest.layers) {
@@ -527,7 +539,7 @@ var Flatpod = GObject.registerClass({
   }
 
   writeFiles(buildDir, image, imageConfig, runtimeInfo) {
-    let progress = new Progress('Writing required files...', 4, ProgressKind.Slash)
+    let progress = new Progress('Writing required files...', 4, ProgressKind.slash)
 
     this.writeFlatpakMetadata(buildDir, imageConfig, runtimeInfo)
     progress.next()
@@ -672,7 +684,7 @@ var Flatpod = GObject.registerClass({
     }
 
     let progress = new Progress('Looking for unused refs...', installed.length,
-                                ProgressKind.Slash)
+                                ProgressKind.slash)
 
     for (let flatpakRef of installed) {
       let ostreeRef = flatpakRef.format_ref()
@@ -747,7 +759,7 @@ var Flatpod = GObject.registerClass({
     return bytesDeleted
   }
 
-  cleanupRepo(repo, cleanupType) {
+  cleanupRepo(repo, cleanupType, tmpDir) {
     let bytesDeleted = 0
 
     repo.open(null)
@@ -767,6 +779,7 @@ var Flatpod = GObject.registerClass({
 
     repo.commit_transaction(null)
 
+    bytesDeleted += this.removeAllBuildDirs(tmpDir)
     bytesDeleted += this.clearUncompressedObjectCache(repo)
     bytesDeleted += this.pruneRepo(repo)
 
@@ -791,6 +804,11 @@ var Flatpod = GObject.registerClass({
     let repoDir = dataDir.get_child('repo')
     let repo = OSTree.Repo.new(repoDir)
 
+    let tmpDir = dataDir.get_child('builds')
+    if (!tmpDir.query_exists(null)) {
+      tmpDir.make_directory_with_parents(null)
+    }
+
     if (cmdline.cleanup) {
       let cleanupTypeString = cmdline.cleanup.unpack().unpack()
       let cleanupType = CleanupType[cleanupTypeString]
@@ -798,7 +816,7 @@ var Flatpod = GObject.registerClass({
         print(`Invalid cleanup type: ${cleanupTypeString}`)
       }
 
-      this.cleanupRepo(repo, cleanupType)
+      this.cleanupRepo(repo, cleanupType, tmpDir)
       System.exit(0)
     }
 
@@ -811,11 +829,6 @@ var Flatpod = GObject.registerClass({
     let image = args[0]
     if (image.indexOf(':') == -1) {
       image += ':latest'
-    }
-    let tmpDir = dataDir.get_child('builds')
-
-    if (!tmpDir.query_exists(null)) {
-      tmpDir.make_directory_with_parents(null)
     }
 
     GLib.setenv('TMPDIR', tmpDir.get_path(), true)
@@ -850,6 +863,7 @@ var Flatpod = GObject.registerClass({
     this.success(`You can now run: ${runtimeInfo.fullName}`)
   }
 })
+
 
 GLib.set_prgname('flatpod')
 GLib.set_application_name('flatpod')
