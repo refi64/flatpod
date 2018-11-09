@@ -42,9 +42,17 @@ const OCI_ARCH_TO_FLATPAK = {
 const FLATPOD_REMOTE = 'flatpod-origin'
 
 
+let CleanupType = {
+  all: Symbol('CleanupType.all'),
+  oci: Symbol('CleanupType.oci'),
+  unused: Symbol('CleanupType.unused'),
+  prune: Symbol('CleanupType.prune'),
+}
+
+
 let ProgressKind = {
-  Percent: Symbol('Percent'),
-  Slash: Symbol('Slash'),
+  Percent: Symbol('ProgressKind.Percent'),
+  Slash: Symbol('ProgressKind.Slash'),
 }
 
 
@@ -118,11 +126,15 @@ var Flatpod = GObject.registerClass({
 
     this.add_main_option('version', 0, 0, GLib.OptionArg.NONE, 'Show the version', null)
     this.add_main_option('verbose', 'v'.charCodeAt(0), 0, GLib.OptionArg.NONE, 'Be verbose', null)
+    this.add_main_option('keep-build-dir', 0, 0, GLib.OptionArg.NONE, 'Keep the build directory',
+                         null)
     this.add_main_option('runtime-id', 'i'.charCodeAt(0), 0, GLib.OptionArg.STRING,
                          'The target runtime ID', 'ID')
     this.add_main_option('runtime-branch', 'b'.charCodeAt(0), 0, GLib.OptionArg.STRING,
                          'The target runtime branch', 'BRANCH')
     this.add_main_option(GLib.OPTION_REMAINING, 0, 0, GLib.OptionArg.STRING_ARRAY, '', null)
+    this.add_main_option('cleanup', 0, 0, GLib.OptionArg.STRING, 'Cleanup',
+                         Object.keys(CleanupType).join('|'))
   }
 
   log(level, message) {
@@ -140,6 +152,19 @@ var Flatpod = GObject.registerClass({
   assert(cond, message) {
     if (!cond) {
       throw new Error(`assertion failed: ${message}`)
+    }
+  }
+
+  success(message) {
+    print(`[\u001b[32mSUCCESS\u001b[0m] ${message}`)
+  }
+
+  undebug(func) {
+    let origValue = GLib.getenv('G_MESSAGES_DEBUG')
+    GLib.setenv('G_MESSAGES_DEBUG', '', true)
+    func()
+    if (origValue) {
+      GLib.setenv('G_MESSAGES_DEBUG', origValue, true)
     }
   }
 
@@ -165,10 +190,13 @@ var Flatpod = GObject.registerClass({
     return {id, branch}
   }
 
-  parseJson(file) {
-    let [success, bytes, etag] = file.load_contents(null)
-    this.assert(success, `failed to read ${file.peek_path()}`)
+  parseJsonBytes(bytes) {
     return JSON.parse(ByteArray.toString(bytes))
+  }
+
+  parseJsonFile(file) {
+    let [success, bytes, etag] = file.load_contents(null)
+    return this.parseJsonBytes(bytes)
   }
 
   escapeString(string) {
@@ -177,6 +205,15 @@ var Flatpod = GObject.registerClass({
 
   getOciRef(suffix) {
     return `ociimage/${suffix}`
+  }
+
+  getDigestRef(digest) {
+    let suffix = digest
+    if (suffix.startsWith('sha256:')) {
+      suffix = suffix.split(':')[1]
+    }
+
+    return this.getOciRef(suffix)
   }
 
   getImageRef(image) {
@@ -200,10 +237,10 @@ var Flatpod = GObject.registerClass({
     this.spawn(['podman', 'push', image, `ostree:${image}@${path}`])
   }
 
-  checkoutRootCommit(targetRepo, imageRef, buildDir) {
+  checkoutRootCommit(repo, imageRef, buildDir) {
     let progress = new Progress('Checking out root commit...')
 
-    let rootCommit = this.checkoutRef(targetRepo, imageRef, buildDir)
+    let rootCommit = this.checkoutRef(repo, imageRef, buildDir)
   }
 
   * walkDirectory(file) {
@@ -258,27 +295,26 @@ var Flatpod = GObject.registerClass({
   }
 
   checkoutOciDigest(repo, digest, target) {
-    this.assert(digest.startsWith('sha256:'), `invalid digest: ${digest}`)
-    let ref = this.getOciRef(digest.split(':')[1])
+    let ref = this.getDigestRef(digest)
     this.checkoutRef(repo, ref, target)
   }
 
   checkoutLayers(repo, target) {
     let manifestFile = target.get_child('manifest.json')
-    let manifest = this.parseJson(manifestFile)
+    let manifest = this.parseJsonFile(manifestFile)
 
     let progress = new Progress('Checking out layers...', manifest.layers.length,
                                 ProgressKind.Slash)
 
-    for (let layer of manifest.layers) {
-      let digest = layer.digest
-      this.checkoutOciDigest(repo, digest, target)
+    this.undebug(() => {
+      for (let layer of manifest.layers) {
+        this.checkoutOciDigest(repo, layer.digest, target)
+        progress.next()
+      }
 
-      progress.next()
-    }
-
-    this.checkoutOciDigest(repo, manifest.config.digest, target)
-    progress.done()
+      this.checkoutOciDigest(repo, manifest.config.digest, target)
+      progress.done()
+    })
   }
 
   fixPermissions(directory) {
@@ -463,12 +499,28 @@ var Flatpod = GObject.registerClass({
     ociRun.replace_contents(`#!/bin/sh\nexec ${command.join(' ')}`, null, false, 0, null)
   }
 
-  writeFlatpakFiles(buildDir, imageConfig, runtimeInfo) {
-    let progress = new Progress('Writing Flatpak files...')
+  writeFlatpodMetadata(buildDir, image) {
+    let kf = new GLib.KeyFile()
+    kf.set_string('Image', 'name', image)
+
+    let flatpodMeta = buildDir.get_child('files').get_child('.flatpod-info')
+    kf.save_to_file(flatpodMeta.get_path())
+  }
+
+  writeFiles(buildDir, image, imageConfig, runtimeInfo) {
+    let progress = new Progress('Writing required files...', 4, ProgressKind.Slash)
 
     this.writeFlatpakMetadata(buildDir, imageConfig, runtimeInfo)
+    progress.next()
+
     this.writeFlatpakAppdata(buildDir, runtimeInfo)
+    progress.next()
+
     this.writeOciRun(buildDir, imageConfig)
+    progress.next()
+
+    this.writeFlatpodMetadata(buildDir, image)
+    progress.done()
   }
 
   commitBuildTree(repo, buildDir, runtimeInfo) {
@@ -513,13 +565,16 @@ var Flatpod = GObject.registerClass({
     }
 
     try {
-      flatpakUserInstall.install(FLATPOD_REMOTE, Flatpak.RefKind.RUNTIME, runtimeInfo.id,
-                                 runtimeInfo.arch, runtimeInfo.branch, progressCallback, null)
+      this.undebug(() => flatpakUserInstall.install(FLATPOD_REMOTE, Flatpak.RefKind.RUNTIME,
+                                                    runtimeInfo.id, runtimeInfo.arch,
+                                                    runtimeInfo.branch, progressCallback, null))
     } catch (e) {
       if (e.matches(Flatpak.Error, Flatpak.Error.ALREADY_INSTALLED)) {
-        flatpakUserInstall.update(Flatpak.UpdateFlags.NONE, Flatpak.RefKind.RUNTIME,
-                                  runtimeInfo.id, runtimeInfo.arch, runtimeInfo.branch,
-                                  progressCallback, null)
+        this.info('Already installed; trying update')
+        this.undebug(() => flatpakUserInstall.update(Flatpak.UpdateFlags.NONE,
+                                                     Flatpak.RefKind.RUNTIME, runtimeInfo.id,
+                                                     runtimeInfo.arch, runtimeInfo.branch,
+                                                     progressCallback, null))
       } else {
         throw e
       }
@@ -528,21 +583,20 @@ var Flatpod = GObject.registerClass({
     progress.done()
   }
 
-  convertImage(image, runtimeInfo, dataDir, buildDir) {
-    let targetRepoFile = dataDir.get_child('repo')
-
-    let targetRepo = OSTree.Repo.new(targetRepoFile)
-    targetRepo.create(OSTree.RepoMode.ARCHIVE_Z2, null)
+  convertImage(image, runtimeInfo, repo, dataDir, buildDir) {
+    repo.create(OSTree.RepoMode.ARCHIVE_Z2, null)
 
     let imageRef = this.getImageRef(image)
     this.info(`Root image ref: ${imageRef}`)
 
-    this.podmanPushToRepo(image, targetRepo)
-    let rootCommit = this.checkoutRootCommit(targetRepo, imageRef, buildDir)
+    this.podmanPushToRepo(image, repo)
+    let rootCommit = this.checkoutRootCommit(repo, imageRef, buildDir)
 
-    this.checkoutLayers(targetRepo, buildDir)
+    this.checkoutLayers(repo, buildDir)
 
-    let imageConfig = this.parseJson(buildDir.get_child('content'))
+    repo.checkout_gc(null)
+
+    let imageConfig = this.parseJsonFile(buildDir.get_child('content'))
     runtimeInfo.arch = OCI_ARCH_TO_FLATPAK[imageConfig.architecture]
     runtimeInfo.fullName = `${runtimeInfo.id}/${runtimeInfo.arch}/${runtimeInfo.branch}`
 
@@ -554,10 +608,142 @@ var Flatpod = GObject.registerClass({
 
     this.mergeUsr(buildDir)
     this.setupFlatpakTree(buildDir)
-    this.writeFlatpakFiles(buildDir, imageConfig, runtimeInfo)
+    this.writeFiles(buildDir, image, imageConfig, runtimeInfo)
 
-    this.commitBuildTree(targetRepo, buildDir, runtimeInfo)
-    this.installFlatpak(targetRepo, runtimeInfo)
+    this.commitBuildTree(repo, buildDir, runtimeInfo)
+    this.installFlatpak(repo, runtimeInfo)
+  }
+
+  readBytesFromRepo(file) {
+    let stream = file.read(null)
+    let allBytes = []
+
+    while (true) {
+      let bytes = stream.read_bytes(4096, null).get_data()
+      if (!bytes.length) {
+        break
+      }
+
+      allBytes.push(...bytes)
+    }
+
+    return new Uint8Array(allBytes)
+  }
+
+  getRefsUsedByImage(repo, image) {
+    let ref = this.getImageRef(image)
+    let [readSuccess, root, commit] = repo.read_commit(ref, null)
+    let manifestFile = root.get_child('manifest.json')
+    let manifest = this.parseJsonBytes(this.readBytesFromRepo(manifestFile))
+
+    return [manifest.config, ...manifest.layers].map((l) => this.getDigestRef(l.digest))
+  }
+
+  removeUnusedBranchesFromRepo(repo, removeUnusedOciBranches) {
+    let flatpakUserInstall = Flatpak.Installation.new_user(null)
+    let installed = flatpakUserInstall.list_installed_refs_by_kind(Flatpak.RefKind.RUNTIME, null)
+    installed = installed.filter((flatpakRef) => flatpakRef.get_origin() == FLATPOD_REMOTE)
+
+    let [success, ostreeRefs] = repo.list_refs(removeUnusedOciBranches ? null : 'runtime', null)
+    let unusedRefs = new Set(Object.keys(ostreeRefs))
+
+    if (!removeUnusedOciBranches) {
+      // Re-add the runtime/ prefix
+      unusedRefs = new Set(Array.from(unusedRefs).map((ref) => `runtime/${ref}`))
+    }
+
+    let progress = new Progress('Looking for unused refs...', installed.length,
+                                ProgressKind.Slash)
+
+    for (let flatpakRef of installed) {
+      let ostreeRef = flatpakRef.format_ref()
+      unusedRefs.delete(ostreeRef)
+      progress.next()
+
+      if (removeUnusedOciBranches) {
+        let [readSuccess, root, commit] = repo.read_commit(ostreeRef, null)
+        let flatpodInfo = root.get_child('files').get_child('.flatpod-info')
+
+        if (flatpodInfo.query_exists(null)) {
+          let contents = this.readBytesFromRepo(flatpodInfo)
+          let kf = new GLib.KeyFile()
+          kf.load_from_bytes(contents, GLib.KeyFileFlags.NONE)
+          let image = kf.get_string('Image', 'name')
+
+          unusedRefs.delete(this.getImageRef(image))
+
+          let usedRefs
+          try {
+            usedRefs = this.getRefsUsedByImage(repo, image)
+          } catch (e) {
+            if (e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.NOT_FOUND)) {
+              continue
+            } else {
+              throw e
+            }
+          }
+
+          for (let layerRef of usedRefs) {
+            unusedRefs.delete(layerRef)
+          }
+        }
+      }
+    }
+
+    progress.done()
+
+    for (let unusedRef of unusedRefs) {
+      repo.transaction_set_ref(null, unusedRef, null)
+    }
+  }
+
+  removeOciBranchesFromRepo(repo) {
+    let progress = new Progress('Clearing OCI image refs...')
+    let [success, refs] = repo.list_refs('ociimage', null)
+
+    for (let ref of Object.keys(refs)) {
+      repo.transaction_set_ref(null, `ociimage/${ref}`, null)
+    }
+  }
+
+  clearUncompressedObjectCache(repo) {
+    // XXX: OSTree doesn't seem to expose an API for this
+    let cacheDir = repo.get_path().get_child('uncompressed-objects-cache')
+    if (!cacheDir.query_exists(null)) {
+      return
+    }
+
+    let cacheSize = this.getDirectoryItemCount(cacheDir)
+    let progress = new Progress('Clearing uncompressed object cache...', cacheSize)
+    this.recursiveDelete(cacheDir, progress)
+    progress.done()
+  }
+
+  cleanupRepo(repo, cleanupType) {
+    repo.open(null)
+    repo.prepare_transaction(null)
+
+    switch (cleanupType) {
+    case CleanupType.unused:
+      this.removeUnusedBranchesFromRepo(repo, true)
+      break;
+    case CleanupType.all:
+      this.removeUnusedBranchesFromRepo(repo, false)
+      // Fallthrough
+    case CleanupType.oci:
+      this.removeOciBranchesFromRepo(repo)
+      break;
+    }
+
+    repo.commit_transaction(null)
+
+    this.clearUncompressedObjectCache(repo)
+
+    let progress = new Progress('Pruning repository...')
+
+    let [_, objFound, objDeleted, bytesDeleted] = repo.prune(OSTree.RepoPruneFlags.REFS_ONLY, 0,
+                                                             null)
+    this.success(`${(bytesDeleted / 1024 / 1024).toFixed(2)}mb deleted`)
   }
 
   vfunc_handle_local_options(cmdlineDict) {
@@ -572,6 +758,21 @@ var Flatpod = GObject.registerClass({
       GLib.setenv('G_MESSAGES_DEBUG', 'all', true)
     }
 
+    let dataDir = Gio.File.new_for_path(GLib.get_user_data_dir()).get_child('flatpod')
+    let repoDir = dataDir.get_child('repo')
+    let repo = OSTree.Repo.new(repoDir)
+
+    if (cmdline.cleanup) {
+      let cleanupTypeString = cmdline.cleanup.unpack().unpack()
+      let cleanupType = CleanupType[cleanupTypeString]
+      if (!cleanupType) {
+        print(`Invalid cleanup type: ${cleanupTypeString}`)
+      }
+
+      this.cleanupRepo(repo, cleanupType)
+      System.exit(0)
+    }
+
     let args = this.getArgs(cmdline)
     if (args.length != 1) {
       print('Expected one argument, a container image.')
@@ -582,8 +783,6 @@ var Flatpod = GObject.registerClass({
     if (image.indexOf(':') == -1) {
       image += ':latest'
     }
-
-    let dataDir = Gio.File.new_for_path(GLib.get_user_data_dir()).get_child('flatpod')
     let tmpDir = dataDir.get_child('builds')
 
     if (!tmpDir.query_exists(null)) {
@@ -608,15 +807,18 @@ var Flatpod = GObject.registerClass({
     let buildDir = Gio.File.new_for_path(buildDirPath)
 
     try {
-      this.assert(false)
-      this.convertImage(image, runtimeInfo, dataDir, buildDir)
+      this.convertImage(image, runtimeInfo, repo, dataDir, buildDir)
     } catch (e) {
       print(`[\u001b[31mERROR\u001b[0m] The build output is located at: ${buildDirPath}`)
       throw e
     }
 
-    this.removeBuildDir(buildDir)
-    print(`[\u001b[32mSUCCESS\u001b[0m] You can now run: ${runtimeInfo.fullName}`)
+    if (cmdline['keep-build-dir']) {
+      this.success(`The build output is located at: ${buildDirPath}`)
+    } else {
+      this.removeBuildDir(buildDir)
+    }
+    this.success(`You can now run: ${runtimeInfo.fullName}`)
   }
 })
 
