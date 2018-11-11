@@ -282,6 +282,11 @@ var Flatpod = GObject.registerClass({
     return bytesDeleted
   }
 
+  fixPermissions(directory) {
+    // XXX: This is far faster than trying to change owner access in Gjs
+    this.spawn(['chmod', '-R', 'u+rw', directory.get_path()])
+  }
+
   removeBuildDir(buildDir) {
     let buildDirSize = this.getDirectoryItemCount(buildDir)
     let progress = new Progress('Removing build directory...', buildDirSize)
@@ -293,6 +298,8 @@ var Flatpod = GObject.registerClass({
     if (!tmpDir.query_exists(null)) {
       return 0
     }
+
+    this.fixPermissions(tmpDir)
 
     let tmpDirSize = this.getDirectoryItemCount(tmpDir)
     if (!tmpDirSize) {
@@ -316,6 +323,7 @@ var Flatpod = GObject.registerClass({
 
     repo.checkout_tree(OSTree.RepoCheckoutMode.USER,
                        OSTree.RepoCheckoutOverwriteMode.UNION_FILES, target, root, fileInfo, null)
+    this.fixPermissions(target)
 
     return commit
   }
@@ -329,6 +337,8 @@ var Flatpod = GObject.registerClass({
     let manifestFile = target.get_child('manifest.json')
     let manifest = this.parseJsonFile(manifestFile)
 
+    this.info(`Manifest:\n${JSON.stringify(manifest, null, 2)}`)
+
     let progress = new Progress('Checking out layers...', manifest.layers.length,
                                 ProgressKind.slash)
 
@@ -341,12 +351,6 @@ var Flatpod = GObject.registerClass({
       this.checkoutOciDigest(repo, manifest.config.digest, target)
       progress.done()
     })
-  }
-
-  fixPermissions(directory) {
-    let progress = new Progress('Fixing filesystem permissions...')
-    // XXX: Gjs has no chmod, and this is probably far faster anyway
-    this.spawn(['chmod', '-R', 'u+rw', directory.get_path()])
   }
 
   cleanupTree(directory) {
@@ -633,13 +637,14 @@ var Flatpod = GObject.registerClass({
     repo.checkout_gc(null)
 
     let imageConfig = this.parseJsonFile(buildDir.get_child('content'))
+    this.info(`Image config: ${JSON.stringify(imageConfig, null, 2)}`)
+
     runtimeInfo.arch = OCI_ARCH_TO_FLATPAK[imageConfig.architecture]
     runtimeInfo.fullName = `${runtimeInfo.id}/${runtimeInfo.arch}/${runtimeInfo.branch}`
 
     this.info(`runtimeInfo.arch: ${runtimeInfo.arch}`)
     this.info(`runtimeInfo.fullName: ${runtimeInfo.fullName}`)
 
-    this.fixPermissions(buildDir)
     this.cleanupTree(buildDir)
 
     this.mergeUsr(buildDir)
@@ -776,6 +781,7 @@ var Flatpod = GObject.registerClass({
       break;
     case CleanupType.all:
       this.removeUnusedBranchesFromRepo(repo, false)
+      bytesDeleted += this.clearUncompressedObjectCache(repo)
       // Fallthrough
     case CleanupType.oci:
       this.removeOciBranchesFromRepo(repo)
@@ -785,7 +791,6 @@ var Flatpod = GObject.registerClass({
     repo.commit_transaction(null)
 
     bytesDeleted += this.removeAllBuildDirs(tmpDir)
-    bytesDeleted += this.clearUncompressedObjectCache(repo)
     bytesDeleted += this.pruneRepo(repo)
 
     let megabytesDeletedString = (bytesDeleted / 1024 / 1024).toFixed(2)
