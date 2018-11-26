@@ -43,6 +43,26 @@ const OCI_ARCH_TO_FLATPAK = {
 const FLATPOD_REMOTE = 'flatpod-origin'
 
 
+const OCI_INIT = `#!/bin/sh
+if [ ! -e /var/run/.oci-init ] && [ -d /etc/oci-init.d ]; then
+  . /etc/oci-init.d/*.sh
+  touch /var/run/.oci-init
+fi
+
+if [ -z "$__OCI_INIT_PS1" ]; then
+  unset PS1
+  PS1="$($SHELL -c 'echo $PS1') "
+
+  # Inside ENV/BASH_ENV script. Have to figure out which!
+  if [ -n "$BASH_VERSION" ]; then
+    [ -z "$__OCI_INIT_BASH_ENV" ] || source "$__OCI_INIT_BASH_ENV"
+  else
+    [ -z "$__OCI_INIT_ENV" ] || source "$__OCI_INIT_ENV"
+  fi
+fi
+`
+
+
 let CleanupType = {
   all: Symbol('CleanupType.all'),
   oci: Symbol('CleanupType.oci'),
@@ -287,6 +307,10 @@ var Flatpod = GObject.registerClass({
     this.spawn(['chmod', '-R', 'u+rw', directory.get_path()])
   }
 
+  makeExecutable(file) {
+    this.spawn(['chmod', '+x', file.get_path()])
+  }
+
   removeBuildDir(buildDir) {
     let buildDirSize = this.getDirectoryItemCount(buildDir)
     let progress = new Progress('Removing build directory...', buildDirSize)
@@ -505,6 +529,25 @@ var Flatpod = GObject.registerClass({
       kf.set_string('Environment', name, value)
     }
 
+    /*
+      We need to run oci-init whenever possible. In ash, this is easy via $ENV. In bash...it's
+      a bit more complicated. Flatpak bash doesn't have Debian's /etc/bash.bashrc, /etc/profile*
+      isn't run (only for --login), and $ENV is only run if --posix is passed. There's
+      $BASH_ENV, but it only runs for shell scripts.
+
+      Therefore, we do the next best thing: $PS1! We can grab the original PS1 while also running
+      oci-init.
+    */
+    let ps1 = imageConfig.config.Env.PS1 || '$(unset PS1; $SHELL -c \'echo $PS1\') '
+    kf.set_string('Environment', 'PS1', '$(__OCI_INIT_PS1=1 . /usr/bin/oci-init)' + ps1)
+
+    // Of course, on e.g. ash or when running bash scripts, we can just use ENV/BASH_ENV.
+    kf.set_string('Environment', '__OCI_INIT_ENV', imageConfig.config.Env.ENV || '')
+    kf.set_string('Environment', '__OCI_INIT_BASH_ENV', imageConfig.config.Env.BASH_ENV || '')
+
+    kf.set_string('Environment', 'ENV', '/usr/bin/oci-init')
+    kf.set_string('Environment', 'BASH_ENV', '/usr/bin/oci-init')
+
     kf.save_to_file(buildDir.get_child('metadata').get_path())
   }
 
@@ -537,6 +580,34 @@ var Flatpod = GObject.registerClass({
 
     let ociRun = buildDir.get_child('files').get_child('bin').get_child('oci-run')
     ociRun.replace_contents(`#!/bin/sh\nexec ${command.join(' ')}`, null, false, 0, null)
+    this.makeExecutable(ociRun)
+  }
+
+  writeInitScript(buildDir, name, contents) {
+    this.info(`writeInitScript: ${name}`)
+
+    let ociRunDir = buildDir.get_child('files').get_child('etc').get_child('oci-init.d')
+    if (!ociRunDir.query_exists(null)) {
+      ociRunDir.make_directory_with_parents(null)
+    }
+
+    let script = ociRunDir.get_child(name + '.sh')
+    script.replace_contents(contents, null, false, 0, null)
+  }
+
+  writeInitScripts(buildDir) {
+    let opt = buildDir.get_child('files').get_child('opt')
+    if (opt.query_exists(null)) {
+      this.writeInitScript(buildDir, 'link-opt', '[ -e /opt ] || ln -s /usr/opt /opt')
+    }
+
+    let init = buildDir.get_child('files').get_child('bin').get_child('oci-init')
+    if (!init.get_parent().query_exists(null)) {
+      init.get_parent().make_directory_with_parents(null)
+    }
+
+    init.replace_contents(OCI_INIT, null, false, 0, null)
+    this.makeExecutable(init)
   }
 
   writeFlatpodMetadata(buildDir, image) {
@@ -548,7 +619,7 @@ var Flatpod = GObject.registerClass({
   }
 
   writeFiles(buildDir, image, imageConfig, runtimeInfo) {
-    let progress = new Progress('Writing required files...', 4, ProgressKind.slash)
+    let progress = new Progress('Writing required files...', 5, ProgressKind.slash)
 
     this.writeFlatpakMetadata(buildDir, imageConfig, runtimeInfo)
     progress.next()
@@ -557,6 +628,9 @@ var Flatpod = GObject.registerClass({
     progress.next()
 
     this.writeOciRun(buildDir, imageConfig)
+    progress.next()
+
+    this.writeInitScripts(buildDir)
     progress.next()
 
     this.writeFlatpodMetadata(buildDir, image)
