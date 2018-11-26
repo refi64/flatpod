@@ -853,21 +853,25 @@ var Flatpod = GObject.registerClass({
     }
 
     repo.open(null)
-    repo.prepare_transaction(null)
 
-    switch (cleanupType) {
-    case CleanupType.unused:
-      this.removeUnusedBranchesFromRepo(repo, true)
-      break;
-    case CleanupType.all:
-      this.removeUnusedBranchesFromRepo(repo, false)
-      // Fallthrough
-    case CleanupType.oci:
-      this.removeOciBranchesFromRepo(repo)
-      break;
+    if (cleanupType != CleanupType.prune) {
+      repo.prepare_transaction(null)
+
+      switch (cleanupType) {
+      case CleanupType.unused:
+        this.removeUnusedBranchesFromRepo(repo, true)
+        break;
+      case CleanupType.all:
+        this.removeUnusedBranchesFromRepo(repo, false)
+        // Fallthrough
+      case CleanupType.oci:
+        this.removeOciBranchesFromRepo(repo)
+        break;
+      }
+
+      repo.commit_transaction(null)
     }
 
-    repo.commit_transaction(null)
     bytesDeleted += this.pruneRepo(repo)
 
     let megabytesDeletedString = (bytesDeleted / 1024 / 1024).toFixed(2)
