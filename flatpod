@@ -185,7 +185,7 @@ var Flatpod = GObject.registerClass({
 
     let serverParts = server.split('.')
     serverParts.reverse()
-    let id = [...serverParts, name].join('.')
+    let id = [...serverParts, name].join('.').replace(/\//g, '.')
 
     let branch = tag == 'latest' ? 'master' : tag
     return {id, branch}
