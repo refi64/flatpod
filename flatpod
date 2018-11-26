@@ -772,6 +772,12 @@ var Flatpod = GObject.registerClass({
   cleanupRepo(repo, cleanupType, tmpDir) {
     let bytesDeleted = 0
 
+    bytesDeleted += this.removeAllBuildDirs(tmpDir)
+
+    if (cleanupType == CleanupType.all) {
+      bytesDeleted += this.clearUncompressedObjectCache(repo)
+    }
+
     repo.open(null)
     repo.prepare_transaction(null)
 
@@ -781,7 +787,6 @@ var Flatpod = GObject.registerClass({
       break;
     case CleanupType.all:
       this.removeUnusedBranchesFromRepo(repo, false)
-      bytesDeleted += this.clearUncompressedObjectCache(repo)
       // Fallthrough
     case CleanupType.oci:
       this.removeOciBranchesFromRepo(repo)
@@ -789,8 +794,6 @@ var Flatpod = GObject.registerClass({
     }
 
     repo.commit_transaction(null)
-
-    bytesDeleted += this.removeAllBuildDirs(tmpDir)
     bytesDeleted += this.pruneRepo(repo)
 
     let megabytesDeletedString = (bytesDeleted / 1024 / 1024).toFixed(2)
@@ -824,6 +827,7 @@ var Flatpod = GObject.registerClass({
       let cleanupType = CleanupType[cleanupTypeString]
       if (!cleanupType) {
         print(`Invalid cleanup type: ${cleanupTypeString}`)
+        System.exit(1)
       }
 
       this.cleanupRepo(repo, cleanupType, tmpDir)
